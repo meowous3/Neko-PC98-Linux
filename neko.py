@@ -83,12 +83,17 @@ timer.start(50);
 class KWinCursorProvider:
     """KDE Plasma: load a KWin script that pushes cursor pos via DBus."""
 
+    STALE_THRESHOLD = 3.0  # seconds without an update before reloading
+
     def __init__(self, dbus_service):
+        import time as _time
         self.svc = dbus_service
         self.script_name = "neko_cursor_tracker"
         self._tmpfile = None
         self._loaded = False
         self._scale = 1.0
+        self._monotonic = _time.monotonic
+        self._last_reload = 0.0
         self._detect_scale()
         self._load_script()
         atexit.register(self.cleanup)
@@ -148,7 +153,34 @@ class KWinCursorProvider:
         except Exception as e:
             print(f"Warning: failed to load KWin script: {e}", file=sys.stderr)
 
+    def _reload_script(self):
+        """Unload and reload the KWin cursor tracking script."""
+        now = self._monotonic()
+        if now - self._last_reload < 10.0:
+            return  # don't spam reloads
+        self._last_reload = now
+        print("neko: cursor tracking stale, reloading KWin script",
+              file=sys.stderr)
+        # Unload old script
+        if self._loaded:
+            try:
+                subprocess.call([
+                    "gdbus", "call", "--session",
+                    "--dest", "org.kde.KWin",
+                    "--object-path", "/Scripting",
+                    "--method", "org.kde.kwin.Scripting.unloadScript",
+                    self.script_name,
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+            self._loaded = False
+        self._load_script()
+
     def get_position(self):
+        # Auto-recover if updates have stopped
+        now = self._monotonic()
+        if now - self.svc.last_update > self.STALE_THRESHOLD:
+            self._reload_script()
         x = int(self.svc.cursor_x * self._scale)
         y = int(self.svc.cursor_y * self._scale)
         return x, y
@@ -207,16 +239,20 @@ class CursorDBusService(dbus.service.Object):
     """DBus service that receives cursor position updates from KWin."""
 
     def __init__(self):
+        import time as _time
         bus_name = dbus.service.BusName(DBUS_NAME, dbus.SessionBus())
         super().__init__(bus_name, DBUS_PATH)
         self.cursor_x = 0
         self.cursor_y = 0
+        self.last_update = _time.monotonic()
+        self._monotonic = _time.monotonic
 
     @dbus.service.method(DBUS_NAME, in_signature="s")
     def update(self, pos_str):
         parts = pos_str.split(",")
         self.cursor_x = int(parts[0])
         self.cursor_y = int(parts[1])
+        self.last_update = self._monotonic()
 
 
 def make_cursor_provider():
@@ -571,6 +607,10 @@ class Neko:
             cursor_gy = self.wander_target_y
         else:
             mx, my = self.cursor.get_position()
+            if mx < 0 or my < 0 or mx > self.screen_w or my > self.screen_h:
+                print(f"neko: bad cursor pos ({mx}, {my}), skipping",
+                      file=sys.stderr)
+                return True
             cursor_gx = mx // GRID
             cursor_gy = my // GRID
 
