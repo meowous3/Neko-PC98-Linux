@@ -37,6 +37,7 @@ from gi.repository import AppIndicator3, Gdk, GdkPixbuf, GLib, Gtk
 # ---------------------------------------------------------------------------
 GRID = 8              # pixels per grid cell (original: 8px character cells)
 IDLE_THRESHOLD = 100  # ticks sitting before cat gets bored (0x023C)
+DEADZONE = 64         # pixels — cat won't chase if cursor is within this range
 DEFAULT_TICK_MS = 180 # ms between updates (~5.6 FPS, original: VSYNC/10)
 DEFAULT_MOVE_SPEED = 1  # grid units per tick (original: 1)
 DEFAULT_SCALE = 4     # sprite display scale (34x34 base → 136x136 at 4×)
@@ -359,6 +360,7 @@ def load_config():
         "tick_ms": DEFAULT_TICK_MS,
         "move_speed": DEFAULT_MOVE_SPEED,
         "scale": DEFAULT_SCALE,
+        "deadzone": DEADZONE,
     }
     try:
         with open(CONFIG_PATH) as f:
@@ -368,12 +370,14 @@ def load_config():
     defaults["tick_ms"] = max(50, min(500, int(defaults["tick_ms"])))
     defaults["move_speed"] = max(1, min(8, int(defaults["move_speed"])))
     defaults["scale"] = max(1, min(8, int(defaults["scale"])))
+    defaults["deadzone"] = max(0, min(128, int(defaults["deadzone"])))
     return defaults
 
 
-def save_config(tick_ms, move_speed, scale):
+def save_config(tick_ms, move_speed, scale, deadzone):
     with open(CONFIG_PATH, "w") as f:
-        json.dump({"tick_ms": tick_ms, "move_speed": move_speed, "scale": scale}, f)
+        json.dump({"tick_ms": tick_ms, "move_speed": move_speed,
+                   "scale": scale, "deadzone": deadzone}, f)
 
 
 # =========================================================================
@@ -431,6 +435,7 @@ class Neko:
         self.idle_counter = 0
         self.has_slept = False
         self.flag_wander = False
+        self.scratch_state = ST_SCRATCH_RIGHT
         self.wander_target_x = 0
         self.wander_target_y = 0
 
@@ -441,6 +446,7 @@ class Neko:
         # Speed settings
         self.tick_ms = config["tick_ms"]
         self.move_speed = config["move_speed"]
+        self.deadzone = config["deadzone"]
         self._timer_id = None
 
         self.win.show_all()
@@ -501,46 +507,52 @@ class Neko:
         return (False, ST_UP) if cursor_gy < self.cat_y else (False, ST_DOWN)
 
     # -------------------------------------------------------------------
-    # compare_x (0x03A7): compare cursor X to cat's left edge
-    # Original: if cursor in right half, target = cursor_x - 3 (sprite
-    # width - 1); if left half, target = cursor_x.  Then target vs cat_x.
+    # compare_x (0x03A7): compare cursor X to cat center
     # -------------------------------------------------------------------
     def _compare_x(self, cursor_gx):
-        half = self.screen_w // (2 * GRID)
-        if cursor_gx >= half:
-            target = cursor_gx - self.sprite_gw_minus1
-        else:
-            target = cursor_gx
-        self._eff_target_x = target
-
-        if target == self.cat_x:
+        self._eff_target_x = cursor_gx
+        cat_center_gx = self.cat_x + self.sprite_gw_minus1 // 2
+        if cursor_gx == cat_center_gx:
             return True, -1
         self.idle_counter = 0
         self.has_slept = False
-        return (False, ST_LEFT) if target < self.cat_x else (False, ST_RIGHT)
+        return (False, ST_LEFT) if cursor_gx < cat_center_gx else (False, ST_RIGHT)
 
     # -------------------------------------------------------------------
     # decide_direction (0x03E0)
     # -------------------------------------------------------------------
     def _decide_direction(self, cursor_gx, cursor_gy):
-        if random.getrandbits(1):
-            ay, dy = self._compare_y(cursor_gy)
-            if not ay:
-                self.anim_state = dy
-                return
-            ax, dx = self._compare_x(cursor_gx)
-            if not ax:
-                self.anim_state = dx
-                return
+        # Deadzone: if cat and cursor are close enough, treat as aligned
+        cat_cx = self.cat_x * GRID + self.sprite_w // 2
+        cat_cy = self.cat_y * GRID + self.sprite_h // 2
+        in_deadzone = abs(cursor_gx * GRID - cat_cx) <= self.deadzone and \
+                      abs(cursor_gy * GRID - cat_cy) <= self.deadzone
+
+        # Update facing direction based on cursor position relative to cat center
+        if cursor_gx * GRID > cat_cx:
+            self.scratch_state = ST_SCRATCH_RIGHT
         else:
-            ax, dx = self._compare_x(cursor_gx)
-            if not ax:
-                self.anim_state = dx
-                return
-            ay, dy = self._compare_y(cursor_gy)
-            if not ay:
-                self.anim_state = dy
-                return
+            self.scratch_state = ST_SCRATCH_LEFT
+
+        if not in_deadzone:
+            if random.getrandbits(1):
+                ay, dy = self._compare_y(cursor_gy)
+                if not ay:
+                    self.anim_state = dy
+                    return
+                ax, dx = self._compare_x(cursor_gx)
+                if not ax:
+                    self.anim_state = dx
+                    return
+            else:
+                ax, dx = self._compare_x(cursor_gx)
+                if not ax:
+                    self.anim_state = dx
+                    return
+                ay, dy = self._compare_y(cursor_gy)
+                if not ay:
+                    self.anim_state = dy
+                    return
 
         # .both_aligned (0x040D)
         if self.flag_wander:
@@ -549,14 +561,7 @@ class Neko:
 
         if self.idle_counter < IDLE_THRESHOLD:
             self.idle_counter += 1
-            # Scratch toward the cursor: face the side the cursor is on
-            # relative to the cat's center (more robust than the original's
-            # screen-half check which breaks at modern resolutions)
-            cat_center_gx = self.cat_x + (self.sprite_w // GRID) // 2
-            self.anim_state = (
-                ST_SCRATCH_LEFT if cursor_gx < cat_center_gx
-                else ST_SCRATCH_RIGHT
-            )
+            self.anim_state = self.scratch_state
             return
 
         # .idle_timeout (0x0436)
@@ -588,7 +593,10 @@ class Neko:
             return
         # Clamp movement so the cat can't overshoot the target
         s = self.move_speed
-        tx, ty = self._eff_target_x, self._eff_target_y
+        # Target for cat_x is cursor_gx offset so cat center lands on cursor
+        half_w = self.sprite_gw_minus1 // 2
+        tx = self._eff_target_x - half_w
+        ty = self._eff_target_y
         if self.anim_state == ST_UP:
             self.cat_y = max(self.cat_y - s, ty)
         elif self.anim_state == ST_DOWN:
@@ -708,6 +716,25 @@ class NekoSettings(Gtk.Window):
         grid.attach(scale_scale, 0, 5, 1, 1)
         grid.attach(scale_spin, 1, 5, 1, 1)
 
+        # --- Deadzone ---
+        grid.attach(Gtk.Label(label="Deadzone", xalign=0), 0, 6, 2, 1)
+        self.dz_adj = Gtk.Adjustment(
+            value=neko.deadzone, lower=0, upper=128,
+            step_increment=4, page_increment=16,
+        )
+        dz_scale = Gtk.Scale(
+            orientation=Gtk.Orientation.HORIZONTAL, adjustment=self.dz_adj
+        )
+        dz_scale.set_draw_value(False)
+        dz_scale.set_digits(0)
+        dz_scale.set_hexpand(True)
+        dz_spin = Gtk.SpinButton(adjustment=self.dz_adj, climb_rate=1)
+        dz_spin.set_digits(0)
+        dz_spin.set_width_chars(4)
+        self.dz_adj.connect("value-changed", self._on_dz_changed)
+        grid.attach(dz_scale, 0, 7, 1, 1)
+        grid.attach(dz_spin, 1, 7, 1, 1)
+
         vbox.pack_start(grid, False, False, 0)
 
         # --- Buttons ---
@@ -733,16 +760,21 @@ class NekoSettings(Gtk.Window):
     def _on_scale_changed(self, adj):
         self.neko.set_scale(int(adj.get_value()))
 
+    def _on_dz_changed(self, adj):
+        self.neko.deadzone = int(adj.get_value())
+
     def _on_reset(self, _):
         self.anim_adj.set_value(DEFAULT_TICK_MS)
         self.move_adj.set_value(DEFAULT_MOVE_SPEED)
         self.scale_adj.set_value(DEFAULT_SCALE)
+        self.dz_adj.set_value(DEADZONE)
 
     def _on_save(self, _):
         save_config(
             int(self.anim_adj.get_value()),
             int(self.move_adj.get_value()),
             int(self.scale_adj.get_value()),
+            int(self.dz_adj.get_value()),
         )
 
 
