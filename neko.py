@@ -84,13 +84,13 @@ timer.start(50);
 class KWinCursorProvider:
     """KDE Plasma: load a KWin script that pushes cursor pos via DBus."""
 
-    STALE_THRESHOLD = 3.0  # seconds without an update before reloading
+    STALE_THRESHOLD = 30.0  # seconds without an update before reloading
 
     def __init__(self, dbus_service):
         import time as _time
         self.svc = dbus_service
         self.script_name = "neko_cursor_tracker"
-        self._tmpfile = None
+        self._tmppath = None
         self._loaded = False
         self._scale = 1.0
         self._monotonic = _time.monotonic
@@ -128,11 +128,17 @@ class KWinCursorProvider:
 
     def _load_script(self):
         js = KWIN_JS.format(svc=DBUS_NAME, path=DBUS_PATH)
-        self._tmpfile = tempfile.NamedTemporaryFile(
-            suffix=".js", delete=False, mode="w", prefix="neko_kwin_"
-        )
-        self._tmpfile.write(js)
-        self._tmpfile.close()
+        if not hasattr(self, '_tmppath') or self._tmppath is None:
+            f = tempfile.NamedTemporaryFile(
+                suffix=".js", delete=False, mode="w", prefix="neko_kwin_"
+            )
+            f.write(js)
+            f.close()
+            self._tmppath = f.name
+        else:
+            # Reuse existing temp file
+            with open(self._tmppath, "w") as f:
+                f.write(js)
 
         try:
             result = subprocess.check_output([
@@ -140,9 +146,8 @@ class KWinCursorProvider:
                 "--dest", "org.kde.KWin",
                 "--object-path", "/Scripting",
                 "--method", "org.kde.kwin.Scripting.loadScript",
-                self._tmpfile.name, self.script_name,
+                self._tmppath, self.script_name,
             ], text=True).strip()
-            # result looks like "(0,)" — extract the script ID
             self._script_id = int(result.strip("(),"))
             subprocess.check_call([
                 "gdbus", "call", "--session",
@@ -151,16 +156,19 @@ class KWinCursorProvider:
                 "--method", "org.kde.kwin.Scripting.start",
             ], stdout=subprocess.DEVNULL)
             self._loaded = True
+            print(f"neko: KWin script loaded (id={self._script_id})",
+                  file=sys.stderr)
         except Exception as e:
             print(f"Warning: failed to load KWin script: {e}", file=sys.stderr)
 
     def _reload_script(self):
         """Unload and reload the KWin cursor tracking script."""
         now = self._monotonic()
-        if now - self._last_reload < 10.0:
-            return  # don't spam reloads
+        if now - self._last_reload < 30.0:
+            return
         self._last_reload = now
-        print("neko: cursor tracking stale, reloading KWin script",
+        age = now - self.svc.last_update
+        print(f"neko: reloading KWin script (no update for {age:.1f}s)",
               file=sys.stderr)
         # Unload old script
         if self._loaded:
@@ -178,10 +186,13 @@ class KWinCursorProvider:
         self._load_script()
 
     def get_position(self):
-        # Auto-recover if updates have stopped
         now = self._monotonic()
-        if now - self.svc.last_update > self.STALE_THRESHOLD:
+        age = now - self.svc.last_update
+        if age > self.STALE_THRESHOLD:
             self._reload_script()
+        if age > 2.0:
+            print(f"neko: cursor age={age:.1f}s pos=({self.svc.cursor_x},{self.svc.cursor_y}) scale={self._scale:.2f}",
+                  file=sys.stderr)
         x = int(self.svc.cursor_x * self._scale)
         y = int(self.svc.cursor_y * self._scale)
         return x, y
@@ -199,9 +210,9 @@ class KWinCursorProvider:
             except Exception:
                 pass
             self._loaded = False
-        if self._tmpfile:
+        if self._tmppath:
             try:
-                os.unlink(self._tmpfile.name)
+                os.unlink(self._tmppath)
             except Exception:
                 pass
 
@@ -616,7 +627,7 @@ class Neko:
         else:
             mx, my = self.cursor.get_position()
             if mx < 0 or my < 0 or mx > self.screen_w or my > self.screen_h:
-                print(f"neko: bad cursor pos ({mx}, {my}), skipping",
+                print(f"neko: bad cursor pos ({mx}, {my}), screen=({self.screen_w}x{self.screen_h}), skipping",
                       file=sys.stderr)
                 return True
             cursor_gx = mx // GRID
